@@ -13,7 +13,7 @@ A Python script that monitors your Linux system's health and security. It checks
 1. Download the script:
 ```bash
 git clone https://github.com/Alex-code-sudo/System-Safety-Monitor.git
-cd system-safety-monitor
+cd System-Safety-Monitor
 ```
 
 2. Install required packages:
