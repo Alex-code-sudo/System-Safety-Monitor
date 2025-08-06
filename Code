@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+System Safety Monitor
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+import subprocess
+import psutil
+import smtplib
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+import configparser
+
+class SystemSafetyMonitor:
+    def __init__(self, config_path: str = "config.ini"):
+        """Initialize the safety monitor with configuration."""
+        self.config_path = config_path
+        self.config = self._load_config()
+        self.setup_logging()
+        self.alerts = []
+        
+    def _load_config(self) -> configparser.ConfigParser:
+        """Load configuration from file or create default."""
+        config = configparser.ConfigParser()
+        
+        if os.path.exists(self.config_path):
+            config.read(self.config_path)
+        else:
+            # Create default configuration
+            config['THRESHOLDS'] = {
+                'cpu_percent': '80',
+                'memory_percent': '85',
+                'disk_percent': '90',
+                'temp_celsius': '70',
+                'load_average': '2.0'
+            }
+            config['MONITORING'] = {
+                'check_interval': '60',
+                'log_level': 'INFO',
+                'enable_email_alerts': 'false',
+                'enable_desktop_notifications': 'true'
+            }
+            config['EMAIL'] = {
+                'smtp_server': 'smtp.gmail.com',
+                'smtp_port': '587',
+                'sender_email': '',
+                'sender_password': '',
+                'recipient_email': ''
+            }
+            config['SECURITY'] = {
+                'check_failed_logins': 'true',
+                'check_suspicious_processes': 'true',
+                'check_network_connections': 'true',
+                'failed_login_threshold': '5'
+            }
+            
+            # Save default configuration
+            with open(self.config_path, 'w') as f:
+                config.write(f)
+                
+        return config
+    
+    def setup_logging(self):
+        """Setup logging configuration."""
+        log_level = getattr(logging, self.config['MONITORING']['log_level'])
+        logging.basicConfig(
+            level=log_level,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('safety_monitor.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def check_system_resources(self) -> Dict:
+        """Monitor system resource usage."""
+        results = {}
+        
+        # CPU Usage
+        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_threshold = float(self.config['THRESHOLDS']['cpu_percent'])
+        results['cpu'] = {
+            'usage': cpu_percent,
+            'threshold': cpu_threshold,
+            'alert': cpu_percent > cpu_threshold
+        }
+        
+        # Memory Usage
+        memory = psutil.virtual_memory()
+        memory_threshold = float(self.config['THRESHOLDS']['memory_percent'])
+        results['memory'] = {
+            'usage': memory.percent,
+            'threshold': memory_threshold,
+            'alert': memory.percent > memory_threshold,
+            'available_gb': round(memory.available / (1024**3), 2)
+        }
+        
+        # Disk Usage
+        disk = psutil.disk_usage('/')
+        disk_threshold = float(self.config['THRESHOLDS']['disk_percent'])
+        results['disk'] = {
+            'usage': (disk.used / disk.total) * 100,
+            'threshold': disk_threshold,
+            'alert': (disk.used / disk.total) * 100 > disk_threshold,
+            'free_gb': round(disk.free / (1024**3), 2)
+        }
+        
+        # Load Average
+        load_avg = os.getloadavg()[0]
+        load_threshold = float(self.config['THRESHOLDS']['load_average'])
+        results['load_average'] = {
+            'current': load_avg,
+            'threshold': load_threshold,
+            'alert': load_avg > load_threshold
+        }
+        
+        return results
+    
+    def check_temperature(self) -> Dict:
+        """Monitor system temperature."""
+        results = {'temperature': {}}
+        temp_threshold = float(self.config['THRESHOLDS']['temp_celsius'])
+        
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                max_temp = 0
+                for name, entries in temps.items():
+                    for entry in entries:
+                        if entry.current > max_temp:
+                            max_temp = entry.current
+                
+                results['temperature'] = {
+                    'max_temp': max_temp,
+                    'threshold': temp_threshold,
+                    'alert': max_temp > temp_threshold
+                }
+            else:
+                results['temperature'] = {'error': 'No temperature sensors found'}
+        except Exception as e:
+            results['temperature'] = {'error': str(e)}
+            
+        return results
+    
+    def check_security_issues(self) -> Dict:
+        """Check for security-related issues."""
+        results = {}
+        
+        if self.config['SECURITY'].getboolean('check_failed_logins'):
+            results['failed_logins'] = self._check_failed_logins()
+            
+        if self.config['SECURITY'].getboolean('check_suspicious_processes'):
+            results['suspicious_processes'] = self._check_suspicious_processes()
+            
+        if self.config['SECURITY'].getboolean('check_network_connections'):
+            results['network_connections'] = self._check_network_connections()
+            
+        return results
+    
+    def _check_failed_logins(self) -> Dict:
+        """Check for excessive failed login attempts."""
+        try:
+            result = subprocess.run(['journalctl', '-u', 'ssh', '--since', '1 hour ago', 
+                                   '--grep', 'Failed password'], 
+                                  capture_output=True, text=True)
+            
+            failed_attempts = result.stdout.count('Failed password')
+            threshold = int(self.config['SECURITY']['failed_login_threshold'])
+            
+            return {
+                'count': failed_attempts,
+                'threshold': threshold,
+                'alert': failed_attempts > threshold
+            }
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _check_suspicious_processes(self) -> Dict:
+        """Check for potentially suspicious processes."""
+        suspicious_names = ['nc', 'ncat', 'netcat', 'socat', 'cryptominer', 'xmrig']
+        suspicious_processes = []
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                proc_name = proc.info['name'].lower()
+                if any(sus in proc_name for sus in suspicious_names):
+                    suspicious_processes.append({
+                        'pid': proc.info['pid'],
+                        'name': proc.info['name'],
+                        'cmdline': ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+                
+        return {
+            'processes': suspicious_processes,
+            'alert': len(suspicious_processes) > 0
+        }
+    
+    def _check_network_connections(self) -> Dict:
+        """Check for unusual network connections."""
+        unusual_connections = []
+        
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.status == 'ESTABLISHED' and conn.raddr:
+                # Check for connections to suspicious ports
+                if conn.raddr.port in [4444, 5555, 6666, 7777, 8888, 9999]:
+                    unusual_connections.append({
+                        'local': f"{conn.laddr.ip}:{conn.laddr.port}",
+                        'remote': f"{conn.raddr.ip}:{conn.raddr.port}",
+                        'status': conn.status
+                    })
+        
+        return {
+            'connections': unusual_connections,
+            'alert': len(unusual_connections) > 0
+        }
+    
+    def check_system_services(self) -> Dict:
+        """Check status of critical system services."""
+        critical_services = ['ssh', 'ufw', 'fail2ban', 'cron', 'rsyslog']
+        results = {}
+        
+        for service in critical_services:
+            try:
+                result = subprocess.run(['systemctl', 'is-active', service], 
+                                      capture_output=True, text=True)
+                status = result.stdout.strip()
+                results[service] = {
+                    'status': status,
+                    'alert': status != 'active'
+                }
+            except Exception as e:
+                results[service] = {'error': str(e), 'alert': True}
+                
+        return results
+    
+    def check_disk_health(self) -> Dict:
+        """Check disk health using SMART data."""
+        results = {}
+        
+        try:
+            # Get list of drives
+            result = subprocess.run(['lsblk', '-d', '-n', '-o', 'NAME'], 
+                                  capture_output=True, text=True)
+            drives = [line.strip() for line in result.stdout.split('\n') if line.strip()]
+            
+            for drive in drives:
+                if drive.startswith(('sd', 'nvme')):
+                    try:
+                        smart_result = subprocess.run(['smartctl', '-H', f'/dev/{drive}'], 
+                                                    capture_output=True, text=True)
+                        health_status = 'UNKNOWN'
+                        
+                        if 'PASSED' in smart_result.stdout:
+                            health_status = 'PASSED'
+                        elif 'FAILED' in smart_result.stdout:
+                            health_status = 'FAILED'
+                            
+                        results[drive] = {
+                            'health': health_status,
+                            'alert': health_status == 'FAILED'
+                        }
+                    except Exception:
+                        results[drive] = {'error': 'SMART not available', 'alert': False}
+                        
+        except Exception as e:
+            results['error'] = str(e)
+            
+        return results
+    
+    def send_alert(self, alert_type: str, message: str):
+        """Send alert notification."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert = f"[{timestamp}] {alert_type}: {message}"
+        self.alerts.append(alert)
+        self.logger.warning(alert)
+        
+        # Desktop notification
+        if self.config['MONITORING'].getboolean('enable_desktop_notifications'):
+            try:
+                subprocess.run(['notify-send', 'Safety Monitor Alert', message])
+            except Exception:
+                pass
+        
+        # Email notification
+        if self.config['MONITORING'].getboolean('enable_email_alerts'):
+            self._send_email_alert(alert_type, message)
+    
+    def _send_email_alert(self, alert_type: str, message: str):
+        """Send email alert."""
+        try:
+            sender = self.config['EMAIL']['sender_email']
+            password = self.config['EMAIL']['sender_password']
+            recipient = self.config['EMAIL']['recipient_email']
+            
+            if not all([sender, password, recipient]):
+                return
+            
+            msg = MimeMultipart()
+            msg['From'] = sender
+            msg['To'] = recipient
+            msg['Subject'] = f"Safety Monitor Alert: {alert_type}"
+            
+            body = f"System Safety Alert\n\n{message}\n\nTimestamp: {datetime.now()}"
+            msg.attach(MimeText(body, 'plain'))
+            
+            server = smtplib.SMTP(self.config['EMAIL']['smtp_server'], 
+                                int(self.config['EMAIL']['smtp_port']))
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+            server.quit()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to send email alert: {e}")
+    
+    def generate_report(self, results: Dict) -> str:
+        """Generate comprehensive system report."""
+        report = []
+        report.append("=" * 60)
+        report.append("SYSTEM SAFETY MONITOR REPORT")
+        report.append("=" * 60)
+        report.append(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append("")
+        
+        # System Resources
+        if 'resources' in results:
+            report.append("SYSTEM RESOURCES:")
+            res = results['resources']
+            report.append(f"  CPU Usage: {res['cpu']['usage']:.1f}% (Threshold: {res['cpu']['threshold']}%)")
+            report.append(f"  Memory Usage: {res['memory']['usage']:.1f}% (Available: {res['memory']['available_gb']}GB)")
+            report.append(f"  Disk Usage: {res['disk']['usage']:.1f}% (Free: {res['disk']['free_gb']}GB)")
+            report.append(f"  Load Average: {res['load_average']['current']:.2f}")
+            report.append("")
+        
+        # Temperature
+        if 'temperature' in results and 'max_temp' in results['temperature']:
+            temp = results['temperature']
+            report.append(f"TEMPERATURE: {temp['max_temp']:.1f}°C (Threshold: {temp['threshold']}°C)")
+            report.append("")
+        
+        # Security
+        if 'security' in results:
+            report.append("SECURITY STATUS:")
+            sec = results['security']
+            
+            if 'failed_logins' in sec and 'count' in sec['failed_logins']:
+                report.append(f"  Failed Logins: {sec['failed_logins']['count']} (Last hour)")
+                
+            if 'suspicious_processes' in sec:
+                count = len(sec['suspicious_processes']['processes'])
+                report.append(f"  Suspicious Processes: {count}")
+                
+            if 'network_connections' in sec:
+                count = len(sec['network_connections']['connections'])
+                report.append(f"  Unusual Network Connections: {count}")
+            report.append("")
+        
+        # Services
+        if 'services' in results:
+            report.append("CRITICAL SERVICES:")
+            for service, status in results['services'].items():
+                if 'status' in status:
+                    report.append(f"  {service}: {status['status']}")
+            report.append("")
+        
+        # Alerts
+        if self.alerts:
+            report.append("ACTIVE ALERTS:")
+            for alert in self.alerts[-10:]:  # Show last 10 alerts
+                report.append(f"  {alert}")
+            report.append("")
+        
+        report.append("=" * 60)
+        return "\n".join(report)
+    
+    def run_monitoring_cycle(self) -> Dict:
+        """Run a complete monitoring cycle."""
+        self.logger.info("Starting monitoring cycle")
+        results = {}
+        
+        # Check system resources
+        results['resources'] = self.check_system_resources()
+        
+        # Check temperature
+        results['temperature'] = self.check_temperature()
+        
+        # Check security issues
+        results['security'] = self.check_security_issues()
+        
+        # Check system services
+        results['services'] = self.check_system_services()
+        
+        # Check disk health
+        results['disk_health'] = self.check_disk_health()
+        
+        # Process alerts
+        self._process_alerts(results)
+        
+        return results
+    
+    def _process_alerts(self, results: Dict):
+        """Process and send alerts based on monitoring results."""
+        # Resource alerts
+        if 'resources' in results:
+            res = results['resources']
+            if res['cpu']['alert']:
+                self.send_alert('HIGH_CPU', f"CPU usage: {res['cpu']['usage']:.1f}%")
+            if res['memory']['alert']:
+                self.send_alert('HIGH_MEMORY', f"Memory usage: {res['memory']['usage']:.1f}%")
+            if res['disk']['alert']:
+                self.send_alert('HIGH_DISK', f"Disk usage: {res['disk']['usage']:.1f}%")
+            if res['load_average']['alert']:
+                self.send_alert('HIGH_LOAD', f"Load average: {res['load_average']['current']:.2f}")
+        
+        # Temperature alerts
+        if 'temperature' in results and 'alert' in results['temperature']:
+            if results['temperature']['alert']:
+                temp = results['temperature']['max_temp']
+                self.send_alert('HIGH_TEMPERATURE', f"System temperature: {temp:.1f}°C")
+        
+        # Security alerts
+        if 'security' in results:
+            sec = results['security']
+            
+            if 'failed_logins' in sec and sec['failed_logins'].get('alert', False):
+                count = sec['failed_logins']['count']
+                self.send_alert('FAILED_LOGINS', f"Excessive failed logins: {count}")
+                
+            if 'suspicious_processes' in sec and sec['suspicious_processes'].get('alert', False):
+                procs = sec['suspicious_processes']['processes']
+                proc_names = [p['name'] for p in procs]
+                self.send_alert('SUSPICIOUS_PROCESS', f"Suspicious processes: {', '.join(proc_names)}")
+        
+        # Service alerts
+        if 'services' in results:
+            for service, status in results['services'].items():
+                if status.get('alert', False):
+                    self.send_alert('SERVICE_DOWN', f"Service {service} is not active")
+        
+        # Disk health alerts
+        if 'disk_health' in results:
+            for drive, health in results['disk_health'].items():
+                if health.get('alert', False):
+                    self.send_alert('DISK_HEALTH', f"Drive {drive} health check failed")
+
+def main():
+    parser = argparse.ArgumentParser(description='System Safety Monitor')
+    parser.add_argument('--config', default='config.ini', help='Configuration file path')
+    parser.add_argument('--daemon', action='store_true', help='Run in daemon mode')
+    parser.add_argument('--report', action='store_true', help='Generate single report and exit')
+    parser.add_argument('--setup', action='store_true', help='Setup configuration interactively')
+    
+    args = parser.parse_args()
+    
+    if args.setup:
+        print("Setting up System Safety Monitor...")
+        # Interactive setup would go here
+        print("Configuration file created. Please edit config.ini as needed.")
+        return
+    
+    monitor = SystemSafetyMonitor(args.config)
+    
+    if args.report:
+        # Single report mode
+        results = monitor.run_monitoring_cycle()
+        print(monitor.generate_report(results))
+    elif args.daemon:
+        # Daemon mode
+        check_interval = int(monitor.config['MONITORING']['check_interval'])
+        monitor.logger.info(f"Starting daemon mode with {check_interval}s intervals")
+        
+        try:
+            while True:
+                results = monitor.run_monitoring_cycle()
+                time.sleep(check_interval)
+        except KeyboardInterrupt:
+            monitor.logger.info("Monitoring stopped by user")
+    else:
+        # Interactive mode
+        while True:
+            print("\nSystem Safety Monitor")
+            print("1. Run monitoring cycle")
+            print("2. Generate report")
+            print("3. View recent alerts")
+            print("4. Exit")
+            
+            choice = input("\nSelect option: ")
+            
+            if choice == '1':
+                results = monitor.run_monitoring_cycle()
+                print("\nMonitoring cycle completed.")
+            elif choice == '2':
+                results = monitor.run_monitoring_cycle()
+                print(monitor.generate_report(results))
+            elif choice == '3':
+                if monitor.alerts:
+                    print("\nRecent Alerts:")
+                    for alert in monitor.alerts[-10:]:
+                        print(f"  {alert}")
+                else:
+                    print("\nNo recent alerts.")
+            elif choice == '4':
+                break
+            else:
+                print("Invalid option.")
+
+if __name__ == '__main__':
+    main()
