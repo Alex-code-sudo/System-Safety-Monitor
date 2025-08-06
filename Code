@@ -169,11 +169,33 @@ class SystemSafetyMonitor:
     def _check_failed_logins(self) -> Dict:
         """Check for excessive failed login attempts."""
         try:
-            result = subprocess.run(['journalctl', '-u', 'ssh', '--since', '1 hour ago', 
-                                   '--grep', 'Failed password'], 
-                                  capture_output=True, text=True)
+            # Try different approaches to get failed login data
+            failed_attempts = 0
             
-            failed_attempts = result.stdout.count('Failed password')
+            # Method 1: Try journalctl for SSH
+            try:
+                result = subprocess.run(['journalctl', '-u', 'ssh', '--since', '1 hour ago', 
+                                       '--grep', 'Failed password'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    failed_attempts = result.stdout.count('Failed password')
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            
+            # Method 2: Try auth.log if journalctl failed
+            if failed_attempts == 0:
+                try:
+                    auth_log_paths = ['/var/log/auth.log', '/var/log/secure']
+                    for log_path in auth_log_paths:
+                        if os.path.exists(log_path):
+                            with open(log_path, 'r') as f:
+                                # Get last hour of logs (rough estimation)
+                                lines = f.readlines()[-1000:]  # Last 1000 lines
+                                failed_attempts = sum(1 for line in lines if 'Failed password' in line)
+                            break
+                except (PermissionError, IOError):
+                    pass
+            
             threshold = int(self.config['SECURITY']['failed_login_threshold'])
             
             return {
@@ -181,8 +203,9 @@ class SystemSafetyMonitor:
                 'threshold': threshold,
                 'alert': failed_attempts > threshold
             }
+            
         except Exception as e:
-            return {'error': str(e)}
+            return {'error': f'Failed login check error: {str(e)}', 'alert': False}
     
     def _check_suspicious_processes(self) -> Dict:
         """Check for potentially suspicious processes."""
@@ -233,14 +256,23 @@ class SystemSafetyMonitor:
         for service in critical_services:
             try:
                 result = subprocess.run(['systemctl', 'is-active', service], 
-                                      capture_output=True, text=True)
+                                      capture_output=True, text=True, timeout=5)
                 status = result.stdout.strip()
                 results[service] = {
                     'status': status,
-                    'alert': status != 'active'
+                    'alert': status not in ['active', 'inactive']  # inactive is OK for optional services
                 }
+                
+                # Special handling for optional services
+                if service in ['fail2ban', 'ufw'] and status == 'inactive':
+                    results[service]['alert'] = False  # These services might be intentionally disabled
+                    
+            except subprocess.TimeoutExpired:
+                results[service] = {'error': 'Service check timeout', 'alert': True}
+            except FileNotFoundError:
+                results[service] = {'error': 'systemctl not found', 'alert': True}
             except Exception as e:
-                results[service] = {'error': str(e), 'alert': True}
+                results[service] = {'error': f'Service check failed: {str(e)}', 'alert': True}
                 
         return results
     
@@ -251,30 +283,45 @@ class SystemSafetyMonitor:
         try:
             # Get list of drives
             result = subprocess.run(['lsblk', '-d', '-n', '-o', 'NAME'], 
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                results['error'] = 'lsblk command failed'
+                return results
+                
             drives = [line.strip() for line in result.stdout.split('\n') if line.strip()]
             
             for drive in drives:
                 if drive.startswith(('sd', 'nvme')):
                     try:
+                        # Check if smartctl is available
                         smart_result = subprocess.run(['smartctl', '-H', f'/dev/{drive}'], 
-                                                    capture_output=True, text=True)
+                                                    capture_output=True, text=True, timeout=10)
+                        
+                        if smart_result.returncode == 127:  # Command not found
+                            results[drive] = {'error': 'smartctl not installed', 'alert': False}
+                            continue
+                            
                         health_status = 'UNKNOWN'
                         
                         if 'PASSED' in smart_result.stdout:
                             health_status = 'PASSED'
                         elif 'FAILED' in smart_result.stdout:
                             health_status = 'FAILED'
+                        elif smart_result.returncode != 0:
+                            health_status = 'ERROR'
                             
                         results[drive] = {
                             'health': health_status,
                             'alert': health_status == 'FAILED'
                         }
-                    except Exception:
-                        results[drive] = {'error': 'SMART not available', 'alert': False}
+                    except subprocess.TimeoutExpired:
+                        results[drive] = {'error': 'SMART check timeout', 'alert': False}
+                    except Exception as e:
+                        results[drive] = {'error': f'SMART check failed: {str(e)}', 'alert': False}
                         
         except Exception as e:
-            results['error'] = str(e)
+            results['error'] = f'Disk health check failed: {str(e)}'
             
         return results
     
@@ -288,7 +335,13 @@ class SystemSafetyMonitor:
         # Desktop notification
         if self.config['MONITORING'].getboolean('enable_desktop_notifications'):
             try:
-                subprocess.run(['notify-send', 'Safety Monitor Alert', message])
+                # Check if we're in a desktop environment
+                if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+                    subprocess.run(['notify-send', 'Safety Monitor Alert', message], 
+                                 timeout=5, check=False)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                # notify-send not available or failed
+                pass
             except Exception:
                 pass
         
@@ -405,8 +458,12 @@ class SystemSafetyMonitor:
         results['disk_health'] = self.check_disk_health()
         
         # Process alerts
-        self._process_alerts(results)
+        try:
+            self._process_alerts(results)
+        except Exception as e:
+            self.logger.error(f"Error processing alerts: {e}")
         
+        self.logger.info("Monitoring cycle completed")
         return results
     
     def _process_alerts(self, results: Dict):
@@ -465,55 +522,88 @@ def main():
     
     if args.setup:
         print("Setting up System Safety Monitor...")
-        # Interactive setup would go here
-        print("Configuration file created. Please edit config.ini as needed.")
+        print("Default configuration file will be created on first run.")
+        print("Please edit config.ini to customize settings.")
         return
     
-    monitor = SystemSafetyMonitor(args.config)
+    try:
+        monitor = SystemSafetyMonitor(args.config)
+    except Exception as e:
+        print(f"Error initializing monitor: {e}")
+        sys.exit(1)
     
     if args.report:
         # Single report mode
-        results = monitor.run_monitoring_cycle()
-        print(monitor.generate_report(results))
+        try:
+            results = monitor.run_monitoring_cycle()
+            print(monitor.generate_report(results))
+        except Exception as e:
+            print(f"Error generating report: {e}")
+            sys.exit(1)
+            
     elif args.daemon:
         # Daemon mode
-        check_interval = int(monitor.config['MONITORING']['check_interval'])
-        monitor.logger.info(f"Starting daemon mode with {check_interval}s intervals")
-        
         try:
+            check_interval = int(monitor.config['MONITORING']['check_interval'])
+            monitor.logger.info(f"Starting daemon mode with {check_interval}s intervals")
+            
             while True:
-                results = monitor.run_monitoring_cycle()
-                time.sleep(check_interval)
+                try:
+                    results = monitor.run_monitoring_cycle()
+                    time.sleep(check_interval)
+                except Exception as e:
+                    monitor.logger.error(f"Error in monitoring cycle: {e}")
+                    time.sleep(check_interval)  # Continue monitoring even after errors
+                    
         except KeyboardInterrupt:
             monitor.logger.info("Monitoring stopped by user")
+        except Exception as e:
+            monitor.logger.error(f"Fatal error in daemon mode: {e}")
+            sys.exit(1)
     else:
         # Interactive mode
-        while True:
-            print("\nSystem Safety Monitor")
-            print("1. Run monitoring cycle")
-            print("2. Generate report")
-            print("3. View recent alerts")
-            print("4. Exit")
-            
-            choice = input("\nSelect option: ")
-            
-            if choice == '1':
-                results = monitor.run_monitoring_cycle()
-                print("\nMonitoring cycle completed.")
-            elif choice == '2':
-                results = monitor.run_monitoring_cycle()
-                print(monitor.generate_report(results))
-            elif choice == '3':
-                if monitor.alerts:
-                    print("\nRecent Alerts:")
-                    for alert in monitor.alerts[-10:]:
-                        print(f"  {alert}")
+        try:
+            while True:
+                print("\nSystem Safety Monitor")
+                print("1. Run monitoring cycle")
+                print("2. Generate report")
+                print("3. View recent alerts")
+                print("4. Exit")
+                
+                try:
+                    choice = input("\nSelect option: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nGoodbye!")
+                    break
+                
+                if choice == '1':
+                    try:
+                        results = monitor.run_monitoring_cycle()
+                        print("\nMonitoring cycle completed.")
+                    except Exception as e:
+                        print(f"Error during monitoring: {e}")
+                elif choice == '2':
+                    try:
+                        results = monitor.run_monitoring_cycle()
+                        print(monitor.generate_report(results))
+                    except Exception as e:
+                        print(f"Error generating report: {e}")
+                elif choice == '3':
+                    if monitor.alerts:
+                        print("\nRecent Alerts:")
+                        for alert in monitor.alerts[-10:]:
+                            print(f"  {alert}")
+                    else:
+                        print("\nNo recent alerts.")
+                elif choice == '4':
+                    print("Goodbye!")
+                    break
                 else:
-                    print("\nNo recent alerts.")
-            elif choice == '4':
-                break
-            else:
-                print("Invalid option.")
+                    print("Invalid option. Please choose 1-4.")
+                    
+        except Exception as e:
+            print(f"Error in interactive mode: {e}")
+            sys.exit(1)
 
 if __name__ == '__main__':
     main()
