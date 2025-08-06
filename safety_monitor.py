@@ -15,7 +15,7 @@ import smtplib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from email.mime.text import MimeText
+from email.mime.text import MIMEText
 from email.mime.multipart import MimeMultipart
 import configparser
 
