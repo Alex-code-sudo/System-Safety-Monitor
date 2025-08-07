@@ -373,3 +373,11 @@ The improved version is backward compatible but adds new options:
 2. Check the troubleshooting section
 3. Review log files for error messages
 4. Test individual features with interactive mode
+
+
+
+## ⚠️ Disclaimer
+
+This software is provided "AS IS" without warranty of any kind.
+Use at your own risk. The authors are not liable for any damages
+caused by the use of this software.
