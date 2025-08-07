@@ -28,21 +28,62 @@ An intelligent Python-based system monitor for Linux that monitors your system's
 # Clone repository
 git clone https://github.com/Alex-code-sudo/System-Safety-Monitor.git
 cd System-Safety-Monitor
+```
 
-# Install dependencies
+### Install dependencies
+```bash
 pip3 install -r requirements.txt
+```
+ ### If there is no error, skip to Make executable
+### --------------------------------------------------------------------------------------------------------------------
+### If an error occurs:
 
-# Make executable
+🔧 Solution : Virtual Environment 
+### Create Virtual Environment
+```bash
+python3 -m venv safety_monitor_env
+```
+
+### Activate virtual environment
+```bash
+source safety_monitor_env/bin/activate
+```
+### Install dependencies
+```bash
+pip install -r requirements.txt
+```
+### Make executable
+```bash
 chmod +x safety_monitor.py
+```
 
-# Optional: Install system tools for full functionality
+### Run script
+```bash
+python safety_monitor.py --setup
+```
+
+### To deactivate later:
+```bash
+deactivate
+``` 
+
+### --------------------------------------------------------------------------------------------------------------------
+
+
+
+### Make executable
+```bash
+chmod +x safety_monitor.py
+```
+
+### Optional: Install system tools for full functionality
+```bash
 sudo apt install smartmontools libnotify-bin lm-sensors
 ```
 
 ### Requirements.txt Content
 ```
 psutil>=5.8.0
-configparser>=5.0.0
 ```
 
 ## 🚀 Quick Start
@@ -374,4 +415,8 @@ The improved version is backward compatible but adds new options:
 
 This software is provided "AS IS" without warranty of any kind.
 Use at your own risk. The authors are not liable for any damages
-caused by the use of this software.
+caused by the use of this software. 
+
+## 👉 This software is currently under development.
+
+
