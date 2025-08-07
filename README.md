@@ -366,13 +366,7 @@ The improved version is backward compatible but adds new options:
 - `[ADVANCED]` section
 - Enhanced thresholds
 
-## 📞 Support
 
-### **Getting Help**
-1. Run with `--verbose` for detailed logs
-2. Check the troubleshooting section
-3. Review log files for error messages
-4. Test individual features with interactive mode
 
 
 
