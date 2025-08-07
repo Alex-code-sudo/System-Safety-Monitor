@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from logging.handlers import RotatingFileHandler
 import configparser
 
 class SystemSafetyMonitor:
